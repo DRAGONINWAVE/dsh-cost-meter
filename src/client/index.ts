@@ -13,7 +13,23 @@ type SlotsService = {
   inject(key: string, callback: () => () => void): void
   register(options: Record<string, unknown>, component: unknown): () => void
 }
-type ClientContext = { slots: SlotsService }
+type ClientContext = { slots: SlotsService; effect(callback: () => unknown, name?: string): unknown }
+
+const COST_METER_CSS = [
+  '.dsh-cost-meter-root{text-align:center;max-width:var(--dsh-chat-content-width);box-sizing:border-box;width:100%;padding:4px calc(var(--dsh-composer-side-clearance) + 16px) 0px;color:var(--dsw-alias-label-tertiary);white-space:nowrap;text-overflow:ellipsis;margin:0 auto;font-size:12px;line-height:20px;display:block;overflow:hidden}',
+  '.dsh-cost-meter-tier-idle{color:#22c55e}',
+  '.dsh-cost-meter-tier-peak{color:#ef4444}',
+].join('')
+const COST_METER_CSS_TAG = '@dsh-external/dsh-cost-meter/CostLine.module.css'
+function injectCss(): void {
+  if (typeof document === 'undefined') return
+  if (document.querySelector(`style[data-plugin-css="${COST_METER_CSS_TAG}"]`) !== null) return
+  const tag = document.createElement('style')
+  tag.dataset.plugin = '@dsh-external/dsh-cost-meter'
+  tag.dataset.pluginCss = COST_METER_CSS_TAG
+  tag.textContent = COST_METER_CSS
+  document.head.appendChild(tag)
+}
 
 const DEEPSEEK_PRICE_CNY_PER_1M: Record<string, {
   inputHit: { offPeak: number; peak: number }
@@ -147,6 +163,35 @@ function formatBalance(balance: { totalBalance: string; currency: 'CNY' | 'USD' 
   return `${sym}${balance.totalBalance}`
 }
 
+/** Green → red by occupancy percent (0% green, 100% red). */
+function meterColor(percent: number): string {
+  const hue = 120 - Math.min(100, Math.max(0, percent)) * 1.2
+  return `hsl(${hue}, 75%, 45%)`
+}
+/** Color every context-occupancy ring's fill from its aria-label percent. */
+function applyMeterColors(): void {
+  if (typeof document === 'undefined') return
+  const buttons = document.querySelectorAll('button[aria-haspopup="dialog"][aria-label*="%"]')
+  for (let i = 0; i < buttons.length; i += 1) {
+    const btn = buttons[i]
+    const svg = btn.querySelector('svg')
+    if (!svg) continue
+    const fill = svg.querySelector('circle[stroke-dasharray]')
+    if (!fill) continue
+    const m = /(\d+)\s*%/.exec(btn.getAttribute('aria-label') || '')
+    if (!m) continue
+    ;(fill as HTMLElement).style.stroke = meterColor(parseInt(m[1], 10))
+  }
+}
+/** Watch for the ring appearing/updating; returns the observer disposer. */
+function installMeterColorObserver(): () => void {
+  if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return () => {}
+  const observer = new MutationObserver(applyMeterColors)
+  observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-label'] })
+  applyMeterColors()
+  return () => observer.disconnect()
+}
+
 const MergedStats = memo(function MergedStats(props: any) {
   const useSession = props.useSession
   const useProjection = props.useProjection
@@ -173,17 +218,35 @@ const MergedStats = memo(function MergedStats(props: any) {
     const cacheHit = cacheHitPercent(usage)
     if (cacheHit !== null) groups.push(`缓存命中 ${cacheHit}%`)
     groups.push(`输入 ${formatTokens(billedInputTokens(usage))} tok · 输出 ${formatTokens(usage.outputTokens)} tok`)
-    let costText = `${tierLabel()} 花费 ${formatCostCny(computeCostCny(usage, sessionModel(settledNodes)))}`
+  }
+
+  let costGroup: any = null
+  let costText: string | null = null
+  if (hasUsage) {
+    const tier = tierLabel()
+    const tierClass = tier === '高峰' ? 'dsh-cost-meter-tier-peak' : 'dsh-cost-meter-tier-idle'
+    costText = `${tier} 花费 ${formatCostCny(computeCostCny(usage, sessionModel(settledNodes)))}`
     const balanceText = formatBalance(balance)
     if (balanceText !== null) costText += ` · 剩余 ${balanceText}`
-    groups.unshift(costText)
+    costGroup = createElement('span', null,
+      createElement('span', { className: tierClass }, tier),
+      costText.slice(tier.length),
+    )
   }
-  if (groups.length === 0) return null
-  const line = groups.join(' | ')
-  return createElement('div', {
-    className: 'dsh-cost-meter-root',
-    title: line,
-  }, line)
+  if (groups.length === 0 && costGroup === null) return null
+
+  const lineParts: string[] = []
+  if (costText !== null) lineParts.push(costText)
+  lineParts.push(...groups)
+  const line = lineParts.join(' | ')
+
+  const children: any[] = []
+  if (costGroup !== null) children.push(costGroup)
+  for (let g = 0; g < groups.length; g += 1) {
+    if (children.length > 0) children.push(' | ')
+    children.push(groups[g])
+  }
+  return createElement('div', { className: 'dsh-cost-meter-root', title: line }, children)
 })
 
 export const inject = ['slots']
@@ -197,4 +260,6 @@ export function apply(ctx: ClientContext): void {
       order: 0,
     }, MergedStats),
   )
+  injectCss()
+  ctx.effect(installMeterColorObserver, '@dsh-external/dsh-cost-meter: context meter colors')
 }
