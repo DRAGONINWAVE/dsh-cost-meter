@@ -179,10 +179,11 @@ const MergedStats = memo(function MergedStats(props: any) {
     groups.unshift(costText)
   }
   if (groups.length === 0) return null
+  const line = groups.join(' | ')
   return createElement('div', {
     className: 'dsh-cost-meter-root',
-    title: '花费按 DeepSeek 官方价格估算（¥，含峰谷时段）· Cost estimated from DeepSeek list pricing',
-  }, groups.join(' | '))
+    title: line,
+  }, line)
 })
 
 export const inject = ['slots']
