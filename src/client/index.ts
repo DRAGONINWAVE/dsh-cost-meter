@@ -7,7 +7,7 @@
  *
  * `lib/client.js` is committed prebuilt. Regenerate with `npm run build:client`.
  */
-import { createElement, memo, useMemo } from 'react'
+import { createElement, memo, useEffect, useMemo, useState } from 'react'
 
 type SlotsService = {
   inject(key: string, callback: () => () => void): void
@@ -38,6 +38,9 @@ function beijingHour(now: Date): number { return (now.getUTCHours() + 8) % 24 }
 function isDeepSeekPeak(now: Date): boolean {
   const h = beijingHour(now)
   return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+}
+function tierLabel(): string {
+  return isDeepSeekPeak(new Date()) ? '高峰' : '空闲'
 }
 function sessionModel(nodes: readonly any[]): string {
   for (let i = nodes.length - 1; i >= 0; i -= 1) {
@@ -118,6 +121,32 @@ function cacheHitPercent(usage: any): number | null {
   return denominator === 0 ? null : Math.round((usage.cacheReadTokens ?? 0) / denominator * 100)
 }
 
+function useBalance(): { totalBalance: string; currency: 'CNY' | 'USD' } | null {
+  const [balance, setBalance] = useState<{ totalBalance: string; currency: 'CNY' | 'USD' } | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const load = () => {
+      fetch('/@dsh-external/dsh-cost-meter/balance')
+        .then((r) => r.json())
+        .then((data) => {
+          if (cancelled || !data || data.ok !== true || data.totalBalance == null) return
+          setBalance({ totalBalance: String(data.totalBalance), currency: data.currency === 'USD' ? 'USD' : 'CNY' })
+        })
+        .catch(() => {})
+    }
+    load()
+    const timer = setInterval(load, 60000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [])
+  return balance
+}
+
+function formatBalance(balance: { totalBalance: string; currency: 'CNY' | 'USD' } | null): string | null {
+  if (balance === null) return null
+  const sym = balance.currency === 'USD' ? '$' : '¥'
+  return `${sym}${balance.totalBalance}`
+}
+
 const MergedStats = memo(function MergedStats(props: any) {
   const useSession = props.useSession
   const useProjection = props.useProjection
@@ -125,6 +154,7 @@ const MergedStats = memo(function MergedStats(props: any) {
   const usage = useProjection('tokenUsage')
   const projected = useProjection('sessionStats')
   const stats = useMemo(() => projected ?? deriveStats(settledNodes), [projected, settledNodes])
+  const balance = useBalance()
 
   const groups: string[] = []
   if (stats.steps > 0) {
@@ -143,7 +173,10 @@ const MergedStats = memo(function MergedStats(props: any) {
     const cacheHit = cacheHitPercent(usage)
     if (cacheHit !== null) groups.push(`缓存命中 ${cacheHit}%`)
     groups.push(`输入 ${formatTokens(billedInputTokens(usage))} tok · 输出 ${formatTokens(usage.outputTokens)} tok`)
-    groups.unshift(`花费 ${formatCostCny(computeCostCny(usage, sessionModel(settledNodes)))}`)
+    let costText = `${tierLabel()} 花费 ${formatCostCny(computeCostCny(usage, sessionModel(settledNodes)))}`
+    const balanceText = formatBalance(balance)
+    if (balanceText !== null) costText += ` · 剩余 ${balanceText}`
+    groups.unshift(costText)
   }
   if (groups.length === 0) return null
   return createElement('div', {
