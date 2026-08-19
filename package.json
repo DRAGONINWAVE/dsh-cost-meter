@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-cost-meter",
-  "version": "0.0.1",
-  "description": "DeepSeek Harness 会话成本计费条：在对话输入框下方按 DeepSeek 官方价格（¥，峰谷时段）估算本次会话花费",
+  "version": "0.0.2",
+  "description": "DeepSeek Harness 会话成本计费条：逐次请求按 DeepSeek 官方价格（¥，模型 + 峰谷时段）计算任务花费，含子代理会话",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -16,7 +16,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
   "keywords": [
@@ -41,6 +42,9 @@
     "build:client": "tsdown"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-runtime",

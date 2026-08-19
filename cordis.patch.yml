@@ -1,0 +1,7 @@
+# dsh-cost-meter bundle 层：插入成本计费条插件行。
+# host 端注册 /@dsh-external/dsh-cost-meter/balance 路由（余额查询），
+# client 端在对话输入框下方渲染会话成本/耗时统计条。
+- insert:
+    - id: dsh-cost-meter
+      name: '@dsh-external/dsh-cost-meter'
+      config: {}

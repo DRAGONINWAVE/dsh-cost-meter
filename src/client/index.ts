@@ -5,6 +5,17 @@
  * (same id `stats`, lower priority -1) and renders ONE merged line:
  * `花费 ¥… | 5 轮 · 91 步 | LLM … | … | 缓存命中 …% | 输入 … tok · 输出 … tok`.
  *
+ * The ¥ figure is NOT computed here. Cost comes from the host route
+ * `/@dsh-external/dsh-cost-meter/cost?session=<id>`, which prices every
+ * provider-reported usage record in the durable log at its own model rate and
+ * its own peak/off-peak tier and adds the task's subagent sessions. Pricing the
+ * client's lump-sum token projection with one model at the current clock — what
+ * this file used to do — disagreed with the platform bill, because
+ * `router-standard` mixes pro/flash mid-session (3× rate), the Beijing 9–12 /
+ * 14–18 peak window doubles rates mid-session, and delegated sessions bill to
+ * the same account from their own logs. When the route cannot answer, the line
+ * shows no ¥ at all rather than a fabricated one.
+ *
  * `lib/client.js` is committed prebuilt. Regenerate with `npm run build:client`.
  */
 import { createElement, memo, useEffect, useMemo, useState } from 'react'
@@ -31,51 +42,16 @@ function injectCss(): void {
   document.head.appendChild(tag)
 }
 
-const DEEPSEEK_PRICE_CNY_PER_1M: Record<string, {
-  inputHit: { offPeak: number; peak: number }
-  inputMiss: { offPeak: number; peak: number }
-  output: { offPeak: number; peak: number }
-}> = {
-  'deepseek-v4-flash': {
-    inputHit: { offPeak: 0.05, peak: 0.1 },
-    inputMiss: { offPeak: 1.5, peak: 3 },
-    output: { offPeak: 4.5, peak: 9 },
-  },
-  'deepseek-v4-pro': {
-    inputHit: { offPeak: 0.15, peak: 0.3 },
-    inputMiss: { offPeak: 4.5, peak: 9 },
-    output: { offPeak: 13.5, peak: 27 },
-  },
-}
-
-const DEFAULT_COST_MODEL = 'deepseek-v4-flash'
-
-function beijingHour(now: Date): number { return (now.getUTCHours() + 8) % 24 }
+/** Peak = Beijing 9:00–12:00 and 14:00–18:00; used for the live tier label only. */
 function isDeepSeekPeak(now: Date): boolean {
-  const h = beijingHour(now)
+  const h = (now.getUTCHours() + 8) % 24
   return (h >= 9 && h < 12) || (h >= 14 && h < 18)
 }
 function tierLabel(): string {
   return isDeepSeekPeak(new Date()) ? '高峰' : '空闲'
 }
-function sessionModel(nodes: readonly any[]): string {
-  for (let i = nodes.length - 1; i >= 0; i -= 1) {
-    const node = nodes[i]
-    if (node.kind !== 'assistant') continue
-    const model = node.provenance?.model ?? node.requestConfig?.model
-    if (typeof model === 'string' && model.length > 0) return model
-  }
-  return DEFAULT_COST_MODEL
-}
 function billedInputTokens(usage: any): number {
   return usage.uncachedInputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
-}
-function computeCostCny(usage: any, model: string): number {
-  const price = DEEPSEEK_PRICE_CNY_PER_1M[model] ?? DEEPSEEK_PRICE_CNY_PER_1M[DEFAULT_COST_MODEL]
-  const tier = isDeepSeekPeak(new Date()) ? 'peak' : 'offPeak'
-  return ((usage.uncachedInputTokens + (usage.cacheWriteTokens ?? 0)) * price.inputMiss[tier]
-    + (usage.cacheReadTokens ?? 0) * price.inputHit[tier]
-    + usage.outputTokens * price.output[tier]) / 1e6
 }
 function formatCostCny(cny: number): string {
   if (!(cny > 0)) return '¥0.00'
@@ -157,6 +133,44 @@ function useBalance(): { totalBalance: string; currency: 'CNY' | 'USD' } | null 
   return balance
 }
 
+type CostReading = {
+  total: { cost: number; calls: number }
+  session: { cost: number; calls: number }
+  delegated: { cost: number; sessions: number }
+  unpricedModels: string[]
+}
+
+/**
+ * Real per-task cost from the host route. `signal` is any monotone token
+ * counter: bumping it refetches the moment the provider reports new usage, and
+ * the 10s timer keeps a long streaming turn current.
+ */
+function useCost(sessionId: unknown, signal: number): CostReading | null {
+  const [cost, setCost] = useState<CostReading | null>(null)
+  useEffect(() => {
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    let cancelled = false
+    const load = () => {
+      fetch(`/@dsh-external/dsh-cost-meter/cost?session=${encodeURIComponent(sessionId)}`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (cancelled || !data || data.ok !== true || typeof data.total?.cost !== 'number') return
+          setCost({
+            total: { cost: data.total.cost, calls: data.total.calls ?? 0 },
+            session: { cost: data.session?.cost ?? 0, calls: data.session?.calls ?? 0 },
+            delegated: { cost: data.delegated?.cost ?? 0, sessions: data.delegated?.sessions ?? 0 },
+            unpricedModels: Array.isArray(data.unpricedModels) ? data.unpricedModels : [],
+          })
+        })
+        .catch(() => {})
+    }
+    load()
+    const timer = setInterval(load, 10000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [sessionId, signal])
+  return cost
+}
+
 function formatBalance(balance: { totalBalance: string; currency: 'CNY' | 'USD' } | null): string | null {
   if (balance === null) return null
   const sym = balance.currency === 'USD' ? '$' : '¥'
@@ -200,6 +214,8 @@ const MergedStats = memo(function MergedStats(props: any) {
   const projected = useProjection('sessionStats')
   const stats = useMemo(() => projected ?? deriveStats(settledNodes), [projected, settledNodes])
   const balance = useBalance()
+  const hasUsage = usage !== void 0 && (billedInputTokens(usage) > 0 || usage.outputTokens > 0)
+  const cost = useCost(props.sessionId, hasUsage ? usage.outputTokens + billedInputTokens(usage) : 0)
 
   const groups: string[] = []
   if (stats.steps > 0) {
@@ -213,7 +229,6 @@ const MergedStats = memo(function MergedStats(props: any) {
     if (stats.decodeMs > 0) speeds.push(`${formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1e3))} tok/s`)
     if (speeds.length > 0) groups.push(speeds.join(' · '))
   }
-  const hasUsage = usage !== void 0 && (billedInputTokens(usage) > 0 || usage.outputTokens > 0)
   if (hasUsage) {
     const cacheHit = cacheHitPercent(usage)
     if (cacheHit !== null) groups.push(`缓存命中 ${cacheHit}%`)
@@ -222,10 +237,13 @@ const MergedStats = memo(function MergedStats(props: any) {
 
   let costGroup: any = null
   let costText: string | null = null
-  if (hasUsage) {
+  if (cost !== null) {
     const tier = tierLabel()
     const tierClass = tier === '高峰' ? 'dsh-cost-meter-tier-peak' : 'dsh-cost-meter-tier-idle'
-    costText = `${tier} 花费 ${formatCostCny(computeCostCny(usage, sessionModel(settledNodes)))}`
+    costText = `${tier} 花费 ${formatCostCny(cost.total.cost)}`
+    if (cost.delegated.sessions > 0 && cost.delegated.cost > 0) {
+      costText += `（子代理 ${cost.delegated.sessions} 个 ${formatCostCny(cost.delegated.cost)}）`
+    }
     const balanceText = formatBalance(balance)
     if (balanceText !== null) costText += ` · 剩余 ${balanceText}`
     costGroup = createElement('span', null,
@@ -238,7 +256,13 @@ const MergedStats = memo(function MergedStats(props: any) {
   const lineParts: string[] = []
   if (costText !== null) lineParts.push(costText)
   lineParts.push(...groups)
-  const line = lineParts.join(' | ')
+  let line = lineParts.join(' | ')
+  if (cost !== null) {
+    line += `\n花费按每次请求的真实模型与当时的峰谷时段计价（本会话 ${formatCostCny(cost.session.cost)}`
+    if (cost.delegated.cost > 0) line += ` + 子代理 ${formatCostCny(cost.delegated.cost)}`
+    line += `，共 ${cost.total.calls} 次请求），数据来自已落盘的会话日志，可能比正在流式输出的这一步落后几秒。`
+    if (cost.unpricedModels.length > 0) line += `\n未收录价目的模型按 pro 价估算：${cost.unpricedModels.join(', ')}`
+  }
 
   const children: any[] = []
   if (costGroup !== null) children.push(costGroup)
